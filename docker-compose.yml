@@ -10,7 +10,7 @@ services:
     ports:
       - "5433:5432"   # Puerto 5433 para no chocar con otros módulos
     volumes:
-      - ./m2-backend/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
       - postgres_m2_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U m2_user -d tefiis_m2"]
@@ -69,7 +69,7 @@ services:
       rabbitmq-m2:
         condition: service_healthy
     volumes:
-      - ./m2-backend:/app  # Hot reload para desarrollo
+      - ./:/app  # Hot reload para desarrollo
 
 volumes:
   postgres_m2_data:
