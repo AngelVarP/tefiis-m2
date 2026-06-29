@@ -1,0 +1,75 @@
+services:
+  # ─── Base de Datos Relacional (M2 - Core Transaccional) ───
+  postgres-m2:
+    image: postgres:15
+    container_name: tefiis_postgres_m2
+    environment:
+      POSTGRES_DB: tefiis_m2
+      POSTGRES_USER: m2_user
+      POSTGRES_PASSWORD: m2_password
+    ports:
+      - "5433:5432"   # Puerto 5433 para no chocar con otros módulos
+    volumes:
+      - ./m2-backend/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_m2_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U m2_user -d tefiis_m2"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ─── Caché & Rate Limiting (M2) ───
+  redis-m2:
+    image: redis:7
+    container_name: tefiis_redis_m2
+    ports:
+      - "6380:6379"   # Puerto 6380 para no chocar con otros módulos
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ─── Broker de Mensajería (Notificaciones asíncronas) ───
+  rabbitmq-m2:
+    image: rabbitmq:3-management
+    container_name: tefiis_rabbitmq_m2
+    ports:
+      - "5673:5672"    # AMQP - Puerto 5673 para no chocar
+      - "15673:15672"  # Panel de administración (http://localhost:15673)
+    environment:
+      RABBITMQ_DEFAULT_USER: m2_user
+      RABBITMQ_DEFAULT_PASS: m2_password
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── API Backend M2 (FastAPI / Python) ───
+  m2-backend:
+    build:
+      context: ./m2-backend
+      dockerfile: Dockerfile
+    container_name: tefiis_m2_backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://m2_user:m2_password@postgres-m2:5432/tefiis_m2
+      REDIS_URL: redis://redis-m2:6379
+      RABBITMQ_URL: amqp://m2_user:m2_password@rabbitmq-m2:5672/
+      JWT_SECRET: tefiis_m2_jwt_secret_academico_2024
+      SIGA_URL: http://mock-siga:8080   # Simulado
+      SIGA_TIMEOUT_SECONDS: 2
+    depends_on:
+      postgres-m2:
+        condition: service_healthy
+      redis-m2:
+        condition: service_healthy
+      rabbitmq-m2:
+        condition: service_healthy
+    volumes:
+      - ./m2-backend:/app  # Hot reload para desarrollo
+
+volumes:
+  postgres_m2_data:
