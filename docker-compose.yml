@@ -49,7 +49,7 @@ services:
   # ─── API Backend M2 (FastAPI / Python) ───
   m2-backend:
     build:
-      context: ./m2-backend
+      context: .
       dockerfile: Dockerfile
     container_name: tefiis_m2_backend
     ports:
