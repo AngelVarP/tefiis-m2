@@ -18,6 +18,9 @@ JWT_SECRET = os.getenv("JWT_SECRET", "tefiis_m2_jwt_secret_academico_2024")
 SIGA_URL = os.getenv("SIGA_URL", "http://mock-siga:8080")
 SIGA_TIMEOUT = int(os.getenv("SIGA_TIMEOUT_SECONDS", "2"))
 
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
 database = Database(DATABASE_URL)
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -38,6 +41,9 @@ app.add_middleware(
 # ─── MODELOS PYDANTIC (Según openapi-m2.yaml) ───
 class ExpedienteRequest(BaseModel):
     codigoEstudiante: str
+    email: Optional[str] = None
+    nombre: Optional[str] = None
+    descripcion: Optional[str] = None
     motivoReclamo: str
     evidencias: Optional[List[str]] = []
 
@@ -92,6 +98,91 @@ async def require_tercio(role_user: tuple = Depends(get_current_user_role)):
 
 def generate_trace_id():
     return str(uuid.uuid4())
+
+async def sync_create_reclamo_supabase(id_expediente: str, request: ExpedienteRequest, estado: str):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("WARNING: SUPABASE_URL or SUPABASE_KEY not set. Supabase sync skipped.")
+        return
+        
+    supabase_state = "PENDIENTE"
+    if estado in ["Registrado", "Pendiente de Validación Manual"]:
+        supabase_state = "PENDIENTE"
+    elif estado in ["Recibido", "Observado"]:
+        supabase_state = "EN_REVISION"
+        
+    payload = {
+        "id": id_expediente,
+        "email": request.email,
+        "nombre": request.nombre,
+        "codigo_estudiante": request.codigoEstudiante,
+        "categoria": request.motivoReclamo,
+        "descripcion": request.descripcion,
+        "estado": supabase_state,
+        "expediente_id_m2": id_expediente
+    }
+    
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/reclamos"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(url, json=payload, headers=headers, timeout=5.0)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"ERROR syncing claim to Supabase: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Error al sincronizar con Supabase: {str(e)}"
+            )
+
+async def sync_update_reclamo_supabase(id_expediente: str, estado_m2: str, resultado_veredicto: Optional[str] = None, justificacion: Optional[str] = None):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("WARNING: SUPABASE_URL or SUPABASE_KEY not set. Supabase sync skipped.")
+        return
+
+    supabase_state = "PENDIENTE"
+    if estado_m2 in ["Registrado", "Pendiente de Validación Manual"]:
+        supabase_state = "PENDIENTE"
+    elif estado_m2 in ["Recibido", "Observado"]:
+        supabase_state = "EN_REVISION"
+    elif estado_m2 == "Resuelto":
+        if resultado_veredicto == "Aceptado":
+            supabase_state = "RESUELTO"
+        elif resultado_veredicto == "Rechazado":
+            supabase_state = "RECHAZADO"
+        else:
+            supabase_state = "RESUELTO"
+
+    payload = {
+        "estado": supabase_state
+    }
+    if justificacion is not None:
+        payload["respuesta"] = justificacion
+        payload["comentario"] = justificacion
+
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/reclamos?id=eq.{id_expediente}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.patch(url, json=payload, headers=headers, timeout=5.0)
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"ERROR updating claim in Supabase: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Error al actualizar en Supabase: {str(e)}"
+            )
 
 # ─── EVENTOS DE LIFECYCLE ───
 @app.on_event("startup")
@@ -192,6 +283,9 @@ async def crear_expediente(request: ExpedienteRequest, idempotency_key: Optional
             query_evid = "INSERT INTO evidencia (id_expediente, url_archivo_adjunto) VALUES (:id_exp, :url)"
             await database.execute(query=query_evid, values={"id_exp": id_expediente, "url": url})
             
+        # Sincronización con Supabase (dentro de la transacción)
+        await sync_create_reclamo_supabase(str(id_expediente), request, estado_inicial)
+            
     return ExpedienteResponse(
         idExpediente=str(id_expediente),
         estadoActual=estado_inicial,
@@ -283,6 +377,14 @@ async def emitir_veredicto(id: str, request: VeredictoRequest, idempotency_key: 
             {"id": id, "est_ant": estado_anterior, "est_nuevo": estado_nuevo, "actor": user_id}
         )
         
+        # Sincronizar actualización con Supabase
+        await sync_update_reclamo_supabase(
+            id_expediente=id,
+            estado_m2=estado_nuevo,
+            resultado_veredicto=request.resultado,
+            justificacion=request.justificacion
+        )
+        
     if idem_key:
         await redis_client.setex(idem_key, 3600, "procesado")
         
@@ -315,6 +417,11 @@ async def subsanar_expediente(id: str, request: SubsanarRequest):
             """INSERT INTO historial_estado (id_expediente, estado_anterior, estado_nuevo, actor_responsable_id) 
                VALUES (:id, :est_ant, :est_nuevo, :actor)""",
             {"id": id, "est_ant": estado_anterior, "est_nuevo": estado_nuevo, "actor": exp["codigo_estudiante"]}
+        )
+        # Sincronizar subsanación con Supabase
+        await sync_update_reclamo_supabase(
+            id_expediente=id,
+            estado_m2=estado_nuevo
         )
         
     exp_actualizado = await database.fetch_one("SELECT id_expediente, estado_actual, prioridad_asignada, fecha_creacion FROM expediente WHERE id_expediente = :id", {"id": id})

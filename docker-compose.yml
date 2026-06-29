@@ -61,6 +61,8 @@ services:
       JWT_SECRET: tefiis_m2_jwt_secret_academico_2024
       SIGA_URL: http://mock-siga:8080   # Simulado
       SIGA_TIMEOUT_SECONDS: 2
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_KEY: ${SUPABASE_KEY}
     depends_on:
       postgres-m2:
         condition: service_healthy
